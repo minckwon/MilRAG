@@ -1,12 +1,12 @@
 """
 QA Dataset Generator for RAG system — local GPU inference via vLLM.
 
-Reads weapon articles from article/weapon/*.json and generates
-question-answer pairs per document using Qwen2.5-32B-Instruct
+Reads articles from article/weapon/*.json and article/mnd/*.json and generates
+exactly one question-answer pair per document using Qwen2.5-32B-Instruct
 running locally on your GPUs.
 
 Usage:
-    python generate_qa.py [--input-dir PATH] [--output PATH] [--qa-per-doc N] [--max-docs N]
+    python generate_qa.py [--input-dirs PATH ...] [--output PATH] [--max-docs N]
     python generate_qa.py --max-docs 5               # smoke-test on 5 docs
     python generate_qa.py --resume                   # continue interrupted run
     python generate_qa.py --tensor-parallel 1        # single GPU (default: 2)
@@ -24,7 +24,10 @@ from vllm import LLM, SamplingParams
 # ---------------------------------------------------------------------------
 
 MODEL_ID = "Qwen/Qwen2.5-32B-Instruct"
-DEFAULT_INPUT_DIR = Path(__file__).parent / "article" / "weapon"
+DEFAULT_INPUT_DIRS = [
+    Path(__file__).parent / "article" / "weapon",
+    Path(__file__).parent / "article" / "mnd",
+]
 DEFAULT_OUTPUT = Path(__file__).parent / "qa_dataset.jsonl"
 MAX_CONTENT_CHARS = 4000   # truncate very long articles to stay within context
 BATCH_SIZE = 16            # number of prompts to submit per vLLM call
@@ -56,10 +59,12 @@ def build_chat_messages(article: dict, qa_count: int) -> list[dict]:
     if len(content) > MAX_CONTENT_CHARS:
         content = content[:MAX_CONTENT_CHARS] + "..."
 
+    category = article.get("category", "")
+    category_line = f"[카테고리]: {category}\n" if category else ""
     user_text = (
         f"다음 문서를 읽고 {qa_count}개의 질문-답변 쌍을 생성하세요.\n\n"
-        f"[문서 제목]: {article['title']}\n"
-        f"[카테고리]: {article['category']}\n"
+        f"[문서 제목]: {article.get('title', '')}\n"
+        f"{category_line}"
         f"[날짜]: {article.get('date') or '미상'}\n\n"
         f"[문서 내용]:\n{content}"
     )
@@ -109,14 +114,18 @@ def extract_json(text: str) -> list[dict]:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_articles(input_dir: Path) -> list[dict]:
+def load_articles(input_dirs: list[Path]) -> list[dict]:
     articles = []
-    for json_file in sorted(input_dir.glob("*.json")):
-        with json_file.open(encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            articles.extend(data)
-        print(f"  Loaded {len(data):>4} articles from {json_file.name}")
+    for input_dir in input_dirs:
+        if not input_dir.exists():
+            print(f"  [warn] Directory not found, skipping: {input_dir}")
+            continue
+        for json_file in sorted(input_dir.glob("*.json")):
+            with json_file.open(encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                articles.extend(data)
+                print(f"  Loaded {len(data):>4} articles from {input_dir.name}/{json_file.name}")
     return articles
 
 
@@ -139,13 +148,11 @@ def load_done_urls(output_path: Path) -> set[str]:
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Generate QA dataset from weapon articles (local vLLM)")
-    parser.add_argument("--input-dir", type=Path, default=DEFAULT_INPUT_DIR,
-                        help="Directory containing weapon *.json files")
+    parser = argparse.ArgumentParser(description="Generate QA dataset from weapon/mnd articles (local vLLM)")
+    parser.add_argument("--input-dirs", type=Path, nargs="+", default=DEFAULT_INPUT_DIRS,
+                        help="Directories containing *.json article files (default: article/weapon, article/mnd)")
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT,
                         help="Output JSONL file path")
-    parser.add_argument("--qa-per-doc", type=int, default=1,
-                        help="Number of QA pairs to generate per document (default: 5)")
     parser.add_argument("--max-docs", type=int, default=None,
                         help="Limit to first N documents (useful for testing)")
     parser.add_argument("--tensor-parallel", type=int, default=2,
@@ -159,8 +166,8 @@ def main():
     # ------------------------------------------------------------------
     # Load articles
     # ------------------------------------------------------------------
-    print(f"\nLoading articles from: {args.input_dir}")
-    articles = load_articles(args.input_dir)
+    print(f"\nLoading articles from: {[str(d) for d in args.input_dirs]}")
+    articles = load_articles(args.input_dirs)
     print(f"Total articles loaded: {len(articles)}")
 
     if args.max_docs:
@@ -207,10 +214,10 @@ def main():
     # ------------------------------------------------------------------
     # Build all prompts
     # ------------------------------------------------------------------
-    print(f"\nBuilding prompts for {len(articles)} articles ({args.qa_per_doc} QA pairs each)...")
+    print(f"\nBuilding prompts for {len(articles)} articles (1 QA pair each)...")
     prompts: list[str] = []
     for article in articles:
-        messages = build_chat_messages(article, args.qa_per_doc)
+        messages = build_chat_messages(article, 1)
         prompt = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
@@ -253,21 +260,22 @@ def main():
                     total_skipped += 1
                     continue
 
-                for pair in pairs:
-                    record = {
-                        "question": pair.get("question", ""),
-                        "answer": pair.get("answer", ""),
-                        "metadata": {
-                            "url": url,
-                            "title": title,
-                            "category": article.get("category", ""),
-                            "date": article.get("date", ""),
-                        },
-                    }
-                    out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
+                # Enforce exactly 1 QA pair per document
+                pair = pairs[0]
+                record = {
+                    "question": pair.get("question", ""),
+                    "answer": pair.get("answer", ""),
+                    "metadata": {
+                        "url": url,
+                        "title": title,
+                        "category": article.get("category", ""),
+                        "date": article.get("date", ""),
+                    },
+                }
+                out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-                total_qa += len(pairs)
-                print(f"  OK  {len(pairs)} pairs | {title[:50]}")
+                total_qa += 1
+                print(f"  OK  1 pair | {title[:50]}")
 
             out_f.flush()
 
