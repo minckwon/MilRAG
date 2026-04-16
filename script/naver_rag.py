@@ -8,15 +8,15 @@ Pipeline
 2. For each QA record in qa_dataset.jsonl:
    a. Embed the question → retrieve top-3 article docs
    b. Check retrieval hit (ground-truth URL in top-3)
-   c. Build context from retrieved contents → generate answer with EXAONE-4.5-33B
-3. Write per-record results to rag_results.jsonl
+   c. Build context from retrieved contents → generate answer with HyperCLOVAX-SEED-Think-32B
+3. Write per-record results to naver_rag_results.jsonl
 
 Output schema per line
 ----------------------
 {
   "question":            str,
   "ground_truth_answer": str,
-  "generated_answer":    str,
+  "generated_answer":    str,   # <think>...</think> 블록 제거된 최종 답변
   "metadata":            {url, title, category, date},
   "retrieval": {
     "retrieved_docs": [{content, metadata, score, rank}, ...],
@@ -32,7 +32,9 @@ import os
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+import contextlib
 import json
+import re
 import time
 from pathlib import Path
 
@@ -42,22 +44,30 @@ import torch
 from tqdm import tqdm
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForCausalLM
+import transformers.modeling_utils as _modeling_utils
+
+# transformers 5.x 에서 no_init_weights 가 제거됨 — 하위 호환 패치
+if not hasattr(_modeling_utils, "no_init_weights"):
+    @contextlib.contextmanager
+    def _no_init_weights(_enable: bool = True):
+        yield
+    _modeling_utils.no_init_weights = _no_init_weights
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-REPO_ROOT      = Path(__file__).parent
+REPO_ROOT      = Path(__file__).parent.parent
 QA_DATASET     = REPO_ROOT / "qa_dataset.jsonl"
 CORPUS_PATH    = REPO_ROOT / "article" / "combined.json"
 INDEX_PATH     = REPO_ROOT / "milrag.index"
 META_PATH      = REPO_ROOT / "milrag_meta.json"
-RESULTS_PATH   = REPO_ROOT / "eval" / "rag_results.jsonl"
+RESULTS_PATH   = REPO_ROOT / "eval" / "naver_rag_results.jsonl"
 
-EMBED_MODEL_ID   = "BAAI/bge-m3"
-GEN_MODEL_ID     = "LGAI-EXAONE/EXAONE-4.0-32B"
-TOP_K            = 3
-BATCH_SIZE       = 1
+EMBED_MODEL_ID = "BAAI/bge-m3"
+GEN_MODEL_ID   = "naver-hyperclovax/HyperCLOVAX-SEED-Think-32B"
+TOP_K          = 3
+BATCH_SIZE     = 1
 
 # ---------------------------------------------------------------------------
 # Prompt
@@ -76,6 +86,16 @@ def build_user_prompt(context: str, question: str) -> str:
         f"[질문]\n{question}\n\n"
         "[답변]"
     )
+
+
+# ---------------------------------------------------------------------------
+# Thinking token 제거
+# ---------------------------------------------------------------------------
+
+def strip_thinking(text: str) -> str:
+    """<think>...</think> 블록을 제거하고 최종 답변만 반환."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -164,12 +184,17 @@ def check_hit(qa_record: dict, retrieved: list[dict]) -> tuple[bool, int | None]
 
 def load_llm() -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     print(f"\n[llm] Loading {GEN_MODEL_ID} ...")
-    tokenizer = AutoTokenizer.from_pretrained(GEN_MODEL_ID, trust_remote_code=True, padding_side="left")
+    tokenizer = AutoTokenizer.from_pretrained(
+        GEN_MODEL_ID,
+        trust_remote_code=True,
+        padding_side="left",
+    )
     model = AutoModelForCausalLM.from_pretrained(
         GEN_MODEL_ID,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         trust_remote_code=True,
+        attn_implementation="eager",
     )
     model.eval()
     return model, tokenizer
@@ -179,9 +204,9 @@ def batch_generate(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
     prompts: list[str],
-    max_new_tokens: int = 512,
-    temperature: float = 0.1,
-    top_p: float = 0.9,
+    max_new_tokens: int = 2048,   # thinking 모델은 토큰을 더 많이 사용
+    temperature: float = 0.6,
+    top_p: float = 0.95,
     gt_answers: list[str] | None = None,
 ) -> list[str]:
     outputs = []
@@ -200,14 +225,16 @@ def batch_generate(
         for i, gen_ids in enumerate(generated_ids):
             input_len = inputs["input_ids"].shape[1]
             new_ids = gen_ids[input_len:]
-            answer = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+            raw = tokenizer.decode(new_ids, skip_special_tokens=True)
+            answer = strip_thinking(raw)          # <think>...</think> 제거
             outputs.append(answer)
             idx = start + i
             print(f"\n{'─' * 60}")
             print(f"[{idx + 1}/{len(prompts)}]")
             if gt_answers is not None:
-                print(f"  GT : {gt_answers[idx]}")
-            print(f"  GEN: {answer}")
+                print(f"  GT  : {gt_answers[idx]}")
+            print(f"  RAW : {raw[:200]}{'...' if len(raw) > 200 else ''}")
+            print(f"  GEN : {answer}")
     return outputs
 
 
@@ -216,7 +243,7 @@ def batch_generate(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    # 1. Load QA dataset (questions + ground-truth answers)
+    # 1. Load QA dataset
     print(f"\n[data] Loading {QA_DATASET} ...")
     qa_records: list[dict] = []
     with QA_DATASET.open(encoding="utf-8") as f:
@@ -278,6 +305,7 @@ def main() -> None:
     generated = batch_generate(model, tokenizer, prompts, gt_answers=[r["answer"] for r in qa_records])
 
     # 6. Write results
+    RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
     print(f"\n[output] Writing {RESULTS_PATH} ...")
     with RESULTS_PATH.open("w", encoding="utf-8") as f:
         for qa_record, ret, gen_ans in zip(qa_records, retrieval_results, generated):
