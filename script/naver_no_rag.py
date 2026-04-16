@@ -33,6 +33,7 @@ import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import transformers.modeling_utils as _modeling_utils
+from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
 
 # transformers 5.x 에서 no_init_weights 가 제거됨 — 하위 호환 패치
 if not hasattr(_modeling_utils, "no_init_weights"):
@@ -40,6 +41,22 @@ if not hasattr(_modeling_utils, "no_init_weights"):
     def _no_init_weights(_enable: bool = True):
         yield
     _modeling_utils.no_init_weights = _no_init_weights
+
+
+# transformers 5.x 에서 ROPE_INIT_FUNCTIONS 의 'default' 키가 제거됨 — 하위 호환 패치
+if "default" not in ROPE_INIT_FUNCTIONS:
+    def _rope_init_default(config, device=None, **kwargs):
+        base = getattr(config, "rope_theta", 10000.0)
+        partial = getattr(config, "partial_rotary_factor", 1.0)
+        head_dim = getattr(config, "head_dim",
+                           config.hidden_size // config.num_attention_heads)
+        dim = int(head_dim * partial)
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, dim, 2, dtype=torch.int64)
+                     .to(device).float() / dim)
+        )
+        return inv_freq, 1.0
+    ROPE_INIT_FUNCTIONS["default"] = _rope_init_default
 
 # ---------------------------------------------------------------------------
 # Config

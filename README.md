@@ -62,14 +62,14 @@ Source: [국방일보 무기백과](https://kookbang.dema.mil.kr/newsWeb/ATCE_CT
 | `aircraft` | 항공기 | 49 |
 | `command_communication` | 지휘통신 | 20 |
 | `defense_robot` | 국방로봇 | 50 |
-| `firepower` | 화력 | 93 |
+| `firepower` | 화력 | 85 |
 | `guided_munition` | 유도무기 | 32 |
 | `maneuver` | 기동 | 54 |
 | `naval_vessel` | 함정 | 31 |
 | `protection` | 방호 | 42 |
 | `RnD` | 연구개발 | 80 |
 | `surveillance_reconnaissance` | 감시정찰 | 21 |
-| **Total** | | **472** |
+| **Total** | | **464** |
 
 ### MND News (`article/mnd/`)
 
@@ -85,7 +85,7 @@ Source: [국방부 국방일보](https://www.mnd.go.kr/cop/kookbang/kookbangIlbo
 
 | File | Articles |
 |---|---:|
-| `combined.json` | 638 |
+| `combined.json` | 638 (weapon 464 + mnd 174) |
 
 ### QA Dataset (`qa_dataset.jsonl`)
 
