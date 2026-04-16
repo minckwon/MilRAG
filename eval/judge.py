@@ -17,13 +17,16 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 # ---------------------------------------------------------------------------
 # ★ 직접 수정하는 설정값
 # ---------------------------------------------------------------------------
 
-OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "OPENAI_API_KEY_REMOVED")   # 또는 직접 문자열 입력
+OPENAI_API_KEY  = os.environ.get("OPENAI_API_KEY", "")   # .env 파일 또는 환경변수로 설정
 MODEL           = "gpt-5.4-mini"
 
 FILE_PATH       = Path(__file__).parent / "exaone_rag_results.jsonl"
